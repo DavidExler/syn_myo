@@ -1,0 +1,3 @@
+.venv/
+*.tif
+*.ipynb

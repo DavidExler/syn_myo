@@ -1,0 +1,8 @@
+2026-03-24 13:11:19,980 - INFO - ================================================================================
+2026-03-24 13:11:19,980 - INFO - Starting 3D CycleGAN Training
+2026-03-24 13:11:19,980 - INFO - ================================================================================
+2026-03-24 13:11:19,980 - INFO - Loading dataset from /srv/exler/syn_myo/real and /srv/exler/syn_myo/syn
+2026-03-24 13:11:19,980 - INFO - Dataset size: 25
+2026-03-24 13:11:20,610 - INFO - Models initialized on device: cpu
+2026-03-24 13:11:20,610 - INFO - Total Gen parameters: 34111489
+2026-03-24 13:11:20,611 - INFO - Starting training for 100 epochs
