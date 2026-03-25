@@ -327,6 +327,195 @@ def _insert_branch(obj, xy, z, thickness_xy, thickness_z, angle, start_xyz, bran
 
     return obj
 
+def _sample_capilars(xy, z, thickness_xy, thickness_z, rng=None):
+    """
+    Sample 0..5 capillaries attached to a main centerline, but return only
+    their properties so they can be inserted later.
+
+    Returns
+    -------
+    capilars : list[dict]
+        Each dict contains:
+            - "join_idx": int
+            - "angle_xy": float         # relative xy angle offset in radians
+            - "angle_z": float          # z slope / tilt term
+            - "thickness_xy": int
+            - "thickness_z": int
+            - "length": int
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n = min(len(xy), len(z), len(thickness_xy), len(thickness_z))
+    if n < 10:
+        return []
+
+    xy = np.asarray(xy)[:n]
+    z = np.asarray(z)[:n]
+    thickness_xy = np.asarray(thickness_xy)[:n]
+    thickness_z = np.asarray(thickness_z)[:n]
+
+    # 0..5, more = less likely
+    # probabilities sum to 1
+    n_cap = int(rng.choice([0, 1, 2, 3, 4, 5], p=[0.33, 0.27, 0.18, 0.11, 0.07, 0.04]))
+    print(f"place {n_cap} capilars")
+    if n_cap == 0:
+        return []
+
+    capilars = []
+    used_positions = set()
+
+    # avoid very start/end
+    low = max(10, n // 20)
+    high = max(low + 1, n - max(3, n // 20))
+    if high <= low:
+        high = low + 5
+
+    for _ in range(n_cap):
+        # try to avoid duplicate / too-close attachment points
+        join_idx = None
+        for _try in range(20):
+            cand = int(rng.integers(low, high))
+            if all(abs(cand - u) > 8 for u in used_positions):
+                join_idx = cand
+                used_positions.add(cand)
+                break
+        if join_idx is None:
+            join_idx = int(rng.integers(low, high))
+
+        base_txy = max(1, float(thickness_xy[join_idx]))
+        base_tz = max(1, float(thickness_z[join_idx]))
+
+        cap = {
+            "join_idx": join_idx,
+            "angle_xy": float(rng.uniform(-1.1, 1.1)),
+            "angle_z": float(rng.uniform(-1.05, 1.05)),
+            "r_xy": int(max(2, round(base_txy * rng.uniform(0.9, 1.3)))),
+            "r_z": int(max(2, round(base_tz * rng.uniform(0.95, 1.3)))),
+            "r_along": max(2, int(round(base_txy * rng.uniform(1.1, 2.0)))),
+        }
+        capilars.append(cap)
+
+    return capilars
+
+def _insert_capilars(obj, xy, z, thickness_xy, thickness_z, angle, start_xyz, capilars):
+    """
+    Insert hollow ellipsoidal capillaries into an already rasterized object.
+
+    Each cap dict is expected to contain:
+        {
+            "join_idx": int,
+            "angle_xy": float,
+            "angle_z": float,
+            "r_xy": int,
+            "r_z": int,
+            "r_along": int,
+        }
+
+    """
+    if capilars is None or len(capilars) == 0:
+        return obj
+
+    # reproduce main truncation / straightening exactly like in _poly_to_3d_object
+    xy_main = np.asarray(xy, dtype=np.float32).copy()
+    z_main = np.asarray(z, dtype=np.float32).copy()
+    thickness_xy = np.ravel(np.asarray(thickness_xy, dtype=np.int16))
+    thickness_z = np.ravel(np.asarray(thickness_z, dtype=np.int16))
+
+    n_main = min(len(xy_main), len(z_main), len(thickness_xy), len(thickness_z))
+    if n_main < 2:
+        return obj
+
+    xy_main = xy_main[:n_main]
+    z_main = z_main[:n_main]
+    thickness_xy = thickness_xy[:n_main]
+    thickness_z = thickness_z[:n_main]
+
+    for i in range(n_main):
+        xy_main[i] = (xy_main[0] - xy_main[-1]) * (i / n_main) + xy_main[i] - xy_main[0]
+
+    c, s = np.cos(angle), np.sin(angle)
+    c_p, s_p = -s, c
+    x0, y0, z0 = map(float, start_xyz)
+
+    grad_xy = np.gradient(xy_main)
+
+    rng = np.random.default_rng()
+
+    for cap in capilars:
+        join_idx = int(cap["join_idx"])
+        if join_idx < 0 or join_idx >= n_main:
+            continue
+
+        r_xy = max(2, int(cap["r_xy"]))
+        r_z = max(2, int(cap["r_z"]))
+        r_along = max(2, int(cap["r_along"]))
+
+        # exact trunk core at join point
+        x_line = x0 + join_idx * c
+        y_line = y0 + join_idx * s
+
+        x_core = x_line + c_p * xy_main[join_idx]
+        y_core = y_line + s_p * xy_main[join_idx]
+        z_core = z0 + z_main[join_idx]
+
+        # local xy tangent from trunk slope
+        dxy = float(grad_xy[join_idx])
+
+        tx = c + c_p * dxy
+        ty = s + s_p * dxy
+        tnorm = np.hypot(tx, ty)
+        if tnorm < 1e-8:
+            tx, ty = c, s
+            tnorm = np.hypot(tx, ty)
+        tx /= tnorm
+        ty /= tnorm
+
+        # rotate tangent by user-sampled local cap angle
+        ang = float(cap["angle_xy"])
+        ux = np.cos(ang) * tx - np.sin(ang) * ty
+        uy = np.sin(ang) * tx + np.cos(ang) * ty
+
+        # perpendicular in xy
+        vx = -uy
+        vy = ux
+
+        # z tilt along major axis
+        uz = float(cap["angle_z"])
+
+        # shell thickness factor: hollow inner ellipsoid
+        hollow_scale = float(rng.uniform(0.3, 0.8))
+
+        # bounding box large enough for tilted ellipsoid
+        pad_xy = int(np.ceil(max(r_along, r_xy) + abs(uz) * r_along)) + 2
+        pad_z = int(np.ceil(r_z + abs(uz) * r_along)) + 2
+
+        for a in range(-r_along - 1, r_along + 2):
+            for b in range(-r_xy - 1, r_xy + 2):
+                for dz in range(-r_z - 1, r_z + 2):
+                    outer_val = (a / r_along) ** 2 + (b / r_xy) ** 2 + (dz / r_z) ** 2
+                    if outer_val > 1.0:
+                        continue
+
+                    inner_val = (
+                        (a / max(1e-6, hollow_scale * r_along)) ** 2
+                        + (b / max(1e-6, hollow_scale * r_xy)) ** 2
+                        + (dz / max(1e-6, hollow_scale * r_z)) ** 2
+                    )
+
+                    # keep shell only
+                    if inner_val <= 1.0:
+                        continue
+
+                    xx = int(round(x_core + a * ux + b * vx))
+                    yy = int(round(y_core + a * uy + b * vy))
+                    zz = int(round(z_core + a * uz + dz))
+
+                    if 0 <= xx < obj.shape[0] and 0 <= yy < obj.shape[1] and 0 <= zz < obj.shape[2]:
+                        obj[xx, yy, zz] = 1
+
+    return obj
+
 def _place_endpoint(x_core, y_core, z_core, t_xy, t_z, c, s, rng=None):
     if rng is None:
         rng = np.random.default_rng()
@@ -492,6 +681,8 @@ def _place_poly(synth, min_thickness, max_thickness, max_tries, wiggle_amp=150, 
         min_end_dist=10,
         max_end_dist=100,
     )
+
+    capilars = _sample_capilars(xy=xy, z=z, thickness_xy=thickness_xy, thickness_z=thickness_z, rng=rng)
     
     shape = synth.shape
     placed = False
@@ -544,6 +735,17 @@ def _place_poly(synth, min_thickness, max_thickness, max_tries, wiggle_amp=150, 
                 start_xyz,
                 branch,
             )
+        if len(capilars) > 0:
+            obj = _insert_capilars(
+                obj,
+                xy,
+                z,
+                thickness_xy,
+                thickness_z,
+                angle,
+                start_xyz,
+                capilars,
+            )
         #r = 1
         #grid = np.indices((2*r+1, 2*r+1, 2*r+1)) - r
         #kernel = (grid**2).sum(0) <= r**2
@@ -554,6 +756,40 @@ def _place_poly(synth, min_thickness, max_thickness, max_tries, wiggle_amp=150, 
     #closed = gaussian_filter(closed.astype(np.float32), sigma=1.0) > 0.5
     
     return synth, False
+
+def _dilate_synth(synth):
+    for z in range(synth.shape[2]):
+        slice_ = synth[z].copy()
+        mask = binary_dilation(synth[..., z] > 0)
+        new_pixels = np.logical_xor(synth[..., z] > 0, mask)
+        coords = np.argwhere(new_pixels)
+
+        for x, y in coords:
+            x0 = max(0, x - 1)
+            x1 = min(slice_.shape[0], x + 2)
+            y0 = max(0, y - 1)
+            y1 = min(slice_.shape[1], y + 2)
+
+            neighborhood = slice_[x0:x1, y0:y1]
+
+            values = neighborhood[neighborhood > 0]
+
+            if values.size == 0:
+                continue
+
+            labels, counts = np.unique(values, return_counts=True)
+
+            # choose most frequent label
+            max_count = counts.max()
+            candidates = labels[counts == max_count]
+
+            if len(candidates) == 1:
+                chosen = candidates[0]
+            else:
+                # tie-break: choose smallest label (deterministic & stable)
+                chosen = candidates.min()
+
+            synth[x, y, z] = chosen
 
 def generate_synth_tif(num_polys, max_tries, shape, name="syn.tif", branch_prob=0.15):
     if not name.endswith(".tif"):
@@ -569,13 +805,14 @@ def generate_synth_tif(num_polys, max_tries, shape, name="syn.tif", branch_prob=
             print(f"placed poly number {n}")
             n += 1
             tries = 0
+            synth = _dilate_synth(synth)
             save=np.transpose(synth, (2, 1, 0)).astype(np.float32)
             tifffile.imwrite(
                 name,
                 save.astype(np.float32),
                 imagej=True
             )
-    return save
+    return synth
 if __name__ == "__main__":
     for i in range(30):
         print("*"*50)
