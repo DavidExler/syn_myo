@@ -1,9 +1,0 @@
-2026-03-24 11:12:24,079 - INFO - ================================================================================
-2026-03-24 11:12:24,079 - INFO - Starting 3D CycleGAN Training
-2026-03-24 11:12:24,079 - INFO - ================================================================================
-2026-03-24 11:12:24,079 - INFO - Loading dataset from C:\Users\david\Documents\Uni\PhD\paper\Myos_syn\repo\real and C:\Users\david\Documents\Uni\PhD\paper\Myos_syn\repo\syn
-2026-03-24 11:12:24,080 - INFO - Dataset size: 25
-2026-03-24 11:12:25,455 - INFO - Models initialized on device: cpu
-2026-03-24 11:12:25,456 - INFO - Total Gen parameters: 34111489
-2026-03-24 11:12:25,456 - INFO - Starting training for 100 epochs
-2026-03-24 11:14:27,184 - INFO - Epoch 1/100 | Batch 0/25 | Gen Loss: 11.9609 | Disc Loss: 2.1859

@@ -1,6 +1,65 @@
+import argparse
+import os
+
 import tifffile
 from scipy.ndimage import binary_erosion, binary_dilation, binary_closing, binary_fill_holes, gaussian_filter
 import numpy as np
+
+
+def parse_shape(shape_str):
+    parts = [part.strip() for part in shape_str.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("shape must be three integers separated by commas")
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("shape must contain integers") from exc
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate synthetic myocyte volumes")
+    parser.add_argument("--output-folder", default="annotations", help="Target output folder")
+    parser.add_argument("--output-stem", default="syn_", help="Filename stem for generated images")
+    parser.add_argument("--num-images", "--num-pictures", dest="num_images", type=int, default=15, help="Number of images to generate")
+    parser.add_argument("--num-polys", "--num-myos", dest="num_polys", type=int, default=64, help="Number of myos per image")
+    parser.add_argument("--max-tries", dest="max_tries", type=int, default=5, help="Max failed image placement attempts before skipping")
+    parser.add_argument("--place-poly-max-tries", type=int, default=20, help="Max attempts to place a single poly")
+    parser.add_argument("--shape", type=parse_shape, default=(1024, 1024, 128), help="Output volume shape as H,W,Z")
+    parser.add_argument("--min-thickness", type=int, default=8, help="Minimum xy thickness for myos")
+    parser.add_argument("--max-thickness", type=int, default=30, help="Maximum xy thickness for myos")
+    parser.add_argument("--branch-prob", type=float, default=0.15, help="Probability a myo gets a secondary branch")
+    parser.add_argument("--wiggle-amp", type=float, default=150.0, help="Scale factor applied to xy wiggle amplitude")
+    parser.add_argument("--z-wiggle-scale", type=float, default=0.3, help="Scale factor applied to z wiggle amplitude relative to xy")
+    parser.add_argument("--xy-max-wiggles", type=float, default=5.0, help="Max wiggle periods used for xy thickness variation")
+    parser.add_argument("--xy-sin-influence", type=float, default=0.15, help="Sine intensity for xy thickness variation")
+    parser.add_argument("--z-max-wiggles", type=float, default=5.0, help="Max wiggle periods used for z thickness variation")
+    parser.add_argument("--z-sin-influence", type=float, default=0.15, help="Sine intensity for z thickness variation")
+    parser.add_argument("--xy-degree", type=int, default=10, help="Polynomial degree for xy centerline")
+    parser.add_argument("--xy-bound", type=float, default=0.75, help="Bound for xy centerline sampling")
+    parser.add_argument("--xy-max-wiggle", type=float, default=0.095, help="Max mean square wiggle for xy centerline")
+    parser.add_argument("--xy-coeff-damper", type=float, default=1.35, help="Coefficient damper for xy centerline")
+    parser.add_argument("--z-degree", type=int, default=6, help="Polynomial degree for z centerline")
+    parser.add_argument("--z-bound", type=float, default=0.25, help="Bound for z centerline sampling")
+    parser.add_argument("--z-max-wiggle", type=float, default=0.005, help="Max mean square wiggle for z centerline")
+    parser.add_argument("--z-coeff-damper", type=float, default=1.35, help="Coefficient damper for z centerline")
+    parser.add_argument("--xy-straight-prob", type=float, default=0.4, help="Probability to insert a straight segment in xy")
+    parser.add_argument("--xy-straight-max-length", type=int, default=500, help="Max straight segment length in xy")
+    parser.add_argument("--z-straight-prob", type=float, default=0.5, help="Probability to insert a straight segment in z")
+    parser.add_argument("--z-straight-max-length", type=int, default=50, help="Max straight segment length in z")
+    parser.add_argument("--branch-min-len", type=int, default=40, help="Min length of a secondary branch")
+    parser.add_argument("--branch-max-len", type=int, default=220, help="Max length of a secondary branch")
+    parser.add_argument("--branch-min-end-dist", type=int, default=10, help="Min end distance for a branch endpoint")
+    parser.add_argument("--branch-max-end-dist", type=int, default=100, help="Max end distance for a branch endpoint")
+    parser.add_argument("--length-min", type=int, default=400, help="Minimum total poly length")
+    parser.add_argument("--length-max", type=int, default=1025, help="Maximum total poly length (exclusive)")
+    parser.add_argument("--z-mean-thickness-min", type=int, default=5, help="Minimum z mean thickness")
+    parser.add_argument("--z-mean-thickness-max", type=int, default=15, help="Maximum z mean thickness")
+    parser.add_argument("--z-max-thickness-extra-min", type=int, default=3, help="Minimum extra thickness added to z mean thickness")
+    parser.add_argument("--z-max-thickness-extra-max", type=int, default=5, help="Maximum extra thickness added to z mean thickness")
+    parser.add_argument("--xy-local-max-thickness-min", type=int, default=3, help="Minimum extra thickness added to xy mean thickness")
+    parser.add_argument("--xy-local-max-thickness-max", type=int, default=8, help="Maximum extra thickness added to xy mean thickness")
+    return parser.parse_args()
+
 
 def sample_wiggly_polynomial(degree, size, bound, max_wiggle=0.01, coeff_damper=1.35):
     """
@@ -366,8 +425,8 @@ def _sample_capilars(xy, z, thickness_xy, thickness_z, rng=None):
     used_positions = set()
 
     # avoid very start/end
-    low = max(10, n // 20)
-    high = max(low + 1, n - max(3, n // 20))
+    low = max(15, n // 10)
+    high = min(n - 15, n - n // 10)
     if high <= low:
         high = low + 5
 
@@ -376,7 +435,7 @@ def _sample_capilars(xy, z, thickness_xy, thickness_z, rng=None):
         join_idx = None
         for _try in range(20):
             cand = int(rng.integers(low, high))
-            if all(abs(cand - u) > 8 for u in used_positions):
+            if all(abs(cand - u) > 40 for u in used_positions):
                 join_idx = cand
                 used_positions.add(cand)
                 break
@@ -388,42 +447,27 @@ def _sample_capilars(xy, z, thickness_xy, thickness_z, rng=None):
 
         cap = {
             "join_idx": join_idx,
-            "angle_xy": float(rng.uniform(-1.1, 1.1)),
-            "angle_z": float(rng.uniform(-1.05, 1.05)),
-            "r_xy": int(max(2, round(base_txy * rng.uniform(0.9, 1.3)))),
-            "r_z": int(max(2, round(base_tz * rng.uniform(0.95, 1.3)))),
-            "r_along": max(2, int(round(base_txy * rng.uniform(1.1, 2.0)))),
+            "angle_xy": float(rng.uniform(0.95, 1.05)),
+            "angle_z": float(rng.uniform(0.975, 1.025)),
+            "r_xy": float(rng.uniform(0.9, 1.15)),
+            "r_z": float(rng.uniform(0.95, 1.2)),
+            "r_along": float(rng.uniform(1.1, 1.5)),
         }
         capilars.append(cap)
 
     return capilars
 
 def _insert_capilars(obj, xy, z, thickness_xy, thickness_z, angle, start_xyz, capilars):
-    """
-    Insert hollow ellipsoidal capillaries into an already rasterized object.
-
-    Each cap dict is expected to contain:
-        {
-            "join_idx": int,
-            "angle_xy": float,
-            "angle_z": float,
-            "r_xy": int,
-            "r_z": int,
-            "r_along": int,
-        }
-
-    """
     if capilars is None or len(capilars) == 0:
         return obj
 
-    # reproduce main truncation / straightening exactly like in _poly_to_3d_object
     xy_main = np.asarray(xy, dtype=np.float32).copy()
     z_main = np.asarray(z, dtype=np.float32).copy()
     thickness_xy = np.ravel(np.asarray(thickness_xy, dtype=np.int16))
     thickness_z = np.ravel(np.asarray(thickness_z, dtype=np.int16))
 
     n_main = min(len(xy_main), len(z_main), len(thickness_xy), len(thickness_z))
-    if n_main < 2:
+    if n_main < 3:
         return obj
 
     xy_main = xy_main[:n_main]
@@ -431,6 +475,7 @@ def _insert_capilars(obj, xy, z, thickness_xy, thickness_z, angle, start_xyz, ca
     thickness_xy = thickness_xy[:n_main]
     thickness_z = thickness_z[:n_main]
 
+    # same straightening as in _poly_to_3d_object
     for i in range(n_main):
         xy_main[i] = (xy_main[0] - xy_main[-1]) * (i / n_main) + xy_main[i] - xy_main[0]
 
@@ -439,28 +484,45 @@ def _insert_capilars(obj, xy, z, thickness_xy, thickness_z, angle, start_xyz, ca
     x0, y0, z0 = map(float, start_xyz)
 
     grad_xy = np.gradient(xy_main)
+    grad_z = np.gradient(z_main)
 
-    rng = np.random.default_rng()
+    sx, sy, sz = obj.shape
 
     for cap in capilars:
         join_idx = int(cap["join_idx"])
-        if join_idx < 0 or join_idx >= n_main:
+        if not (0 <= join_idx < n_main):
             continue
 
-        r_xy = max(2, int(cap["r_xy"]))
-        r_z = max(2, int(cap["r_z"]))
-        r_along = max(2, int(cap["r_along"]))
+        base_txy = max(2, int(round(thickness_xy[join_idx])))
+        base_tz = max(2, int(round(thickness_z[join_idx])))
+
+        # factors -> absolute radii in pixels
+        r_xy = max(2, int(round(base_txy * float(cap["r_xy"]))))
+        r_z = max(2, int(round(base_tz * float(cap["r_z"]))))
+        r_along = max(2, int(round(base_txy * float(cap["r_along"]))))
+
+        if r_xy > r_along:
+            r_xy, r_along = r_along, r_xy
+
+        # shell thickness in pixels
+        shell_xy = max(2, int(round(0.35 * r_xy)))
+        shell_z = max(2, int(round(0.35 * r_z)))
+        shell_along = max(2, int(round(0.35 * r_along)))
+
+        inner_r_xy = max(0, r_xy - shell_xy)
+        inner_r_z = max(0, r_z - shell_z)
+        inner_r_along = max(0, r_along - shell_along)
 
         # exact trunk core at join point
         x_line = x0 + join_idx * c
         y_line = y0 + join_idx * s
-
         x_core = x_line + c_p * xy_main[join_idx]
         y_core = y_line + s_p * xy_main[join_idx]
         z_core = z0 + z_main[join_idx]
 
-        # local xy tangent from trunk slope
+        # local trunk direction from slope at this index
         dxy = float(grad_xy[join_idx])
+        dz_local = float(grad_z[join_idx])
 
         tx = c + c_p * dxy
         ty = s + s_p * dxy
@@ -471,48 +533,72 @@ def _insert_capilars(obj, xy, z, thickness_xy, thickness_z, angle, start_xyz, ca
         tx /= tnorm
         ty /= tnorm
 
-        # rotate tangent by user-sampled local cap angle
-        ang = float(cap["angle_xy"])
-        ux = np.cos(ang) * tx - np.sin(ang) * ty
-        uy = np.sin(ang) * tx + np.cos(ang) * ty
+        local_angle = np.arctan2(ty, tx)
+        scaled_angle = local_angle * float(cap["angle_xy"])
 
-        # perpendicular in xy
+        ux = np.cos(scaled_angle)
+        uy = np.sin(scaled_angle)
         vx = -uy
         vy = ux
+        uz = dz_local * float(cap["angle_z"])
 
-        # z tilt along major axis
-        uz = float(cap["angle_z"])
+        # tighter local bounding box
+        pad_x = int(np.ceil(abs(r_along * ux) + abs(r_xy * vx))) + 2
+        pad_y = int(np.ceil(abs(r_along * uy) + abs(r_xy * vy))) + 2
+        pad_z = int(np.ceil(abs(r_along * uz) + r_z)) + 2
 
-        # shell thickness factor: hollow inner ellipsoid
-        hollow_scale = float(rng.uniform(0.3, 0.8))
+        xc = int(round(x_core))
+        yc = int(round(y_core))
+        zc = int(round(z_core))
 
-        # bounding box large enough for tilted ellipsoid
-        pad_xy = int(np.ceil(max(r_along, r_xy) + abs(uz) * r_along)) + 2
-        pad_z = int(np.ceil(r_z + abs(uz) * r_along)) + 2
+        x_min = max(0, xc - pad_x)
+        x_max = min(sx, xc + pad_x + 1)
+        y_min = max(0, yc - pad_y)
+        y_max = min(sy, yc + pad_y + 1)
+        z_min = max(0, zc - pad_z)
+        z_max = min(sz, zc + pad_z + 1)
 
-        for a in range(-r_along - 1, r_along + 2):
-            for b in range(-r_xy - 1, r_xy + 2):
-                for dz in range(-r_z - 1, r_z + 2):
-                    outer_val = (a / r_along) ** 2 + (b / r_xy) ** 2 + (dz / r_z) ** 2
-                    if outer_val > 1.0:
-                        continue
+        if x_min >= x_max or y_min >= y_max or z_min >= z_max:
+            continue
 
-                    inner_val = (
-                        (a / max(1e-6, hollow_scale * r_along)) ** 2
-                        + (b / max(1e-6, hollow_scale * r_xy)) ** 2
-                        + (dz / max(1e-6, hollow_scale * r_z)) ** 2
-                    )
+        X, Y, Z = np.meshgrid(
+            np.arange(x_min, x_max, dtype=np.float32),
+            np.arange(y_min, y_max, dtype=np.float32),
+            np.arange(z_min, z_max, dtype=np.float32),
+            indexing="ij",
+        )
 
-                    # keep shell only
-                    if inner_val <= 1.0:
-                        continue
+        DX = X - x_core
+        DY = Y - y_core
+        DZ = Z - z_core
 
-                    xx = int(round(x_core + a * ux + b * vx))
-                    yy = int(round(y_core + a * uy + b * vy))
-                    zz = int(round(z_core + a * uz + dz))
+        # coordinates in ellipsoid frame
+        A = DX * ux + DY * uy
+        B = DX * vx + DY * vy
+        C = DZ - A * uz
 
-                    if 0 <= xx < obj.shape[0] and 0 <= yy < obj.shape[1] and 0 <= zz < obj.shape[2]:
-                        obj[xx, yy, zz] = 1
+        outer = (A / r_along) ** 2 + (B / r_xy) ** 2 + (C / r_z) ** 2 <= 1.0
+
+        if inner_r_along > 0 and inner_r_xy > 0 and inner_r_z > 0:
+            inner = (
+                (A / inner_r_along) ** 2
+                + (B / inner_r_xy) ** 2
+                + (C / inner_r_z) ** 2
+                <= 1.0
+            )
+        else:
+            inner = np.zeros_like(outer, dtype=bool)
+
+        shell = outer & (~inner)
+
+        sub = obj[x_min:x_max, y_min:y_max, z_min:z_max]
+
+        # outer shell becomes 1
+        sub[shell] = 1
+        # hollow interior overwrites everything to 0
+        sub[inner] = 0
+
+        obj[x_min:x_max, y_min:y_max, z_min:z_max] = sub
 
     return obj
 
@@ -631,59 +717,81 @@ def _test_fit(synth, candidate, thrsh = 150):
         return False
     return True
 
-def _place_poly(synth, min_thickness, max_thickness, max_tries, wiggle_amp=150, branch_prob=0.15):
+def _place_poly(synth, min_thickness, max_thickness, max_tries, params):
     rng = np.random.default_rng()
 
-    length = int(rng.integers(400, 1025))
+    length = int(rng.integers(params.length_min, params.length_max))
     new_idx = int(synth.max()) + 1
-    print("-"*50)
+    print("-" * 50)
     print(f"placing idx {new_idx}")
-    print("-"*50)
+    print("-" * 50)
 
     _, xy, _, _ = sample_wiggly_polynomial(
-        degree=10, size=length, bound=0.75, max_wiggle=0.095, coeff_damper=1.35
-    ) 
+        degree=params.xy_degree,
+        size=length,
+        bound=params.xy_bound,
+        max_wiggle=params.xy_max_wiggle,
+        coeff_damper=params.xy_coeff_damper,
+    )
     print(np.max(xy), np.min(xy))
-    xy, _, _ = _insert_straight_line(xy, 0.4, min(500, length // 2))
-    xy = xy * wiggle_amp
+    xy, _, _ = _insert_straight_line(
+        xy,
+        params.xy_straight_prob,
+        min(params.xy_straight_max_length, length // 2),
+    )
+    xy = xy * params.wiggle_amp
 
     mean_thickness = int(rng.uniform(min_thickness, max_thickness))
-    local_max_thickness = int(rng.uniform(3, 8)) + mean_thickness
+    local_max_thickness = int(rng.uniform(params.xy_local_max_thickness_min, params.xy_local_max_thickness_max)) + mean_thickness
     thickness_xy, _, _ = _sample_thickness_curve(
         mean_thickness=mean_thickness,
         max_thickness=local_max_thickness,
-        max_wiggles=5,
-        sin_influence=0.15,
+        max_wiggles=params.xy_max_wiggles,
+        sin_influence=params.xy_sin_influence,
         size=length,
     )
 
     _, z, _, _ = sample_wiggly_polynomial(
-        degree=6, size=length, bound=0.25, max_wiggle=0.005, coeff_damper=1.35
+        degree=params.z_degree,
+        size=length,
+        bound=params.z_bound,
+        max_wiggle=params.z_max_wiggle,
+        coeff_damper=params.z_coeff_damper,
     )
-    z, _, _ = _insert_straight_line(z, 0.5, min(50, length // 4))
-    z = z * wiggle_amp * 0.3
-    mean_thickness = np.int16(rng.uniform(5,15)) 
-    max_thickness = np.int16(rng.uniform(3,5)) + mean_thickness
+    z, _, _ = _insert_straight_line(
+        z,
+        params.z_straight_prob,
+        min(params.z_straight_max_length, length // 4),
+    )
+    z = z * params.wiggle_amp * params.z_wiggle_scale
+    mean_thickness = np.int16(rng.uniform(params.z_mean_thickness_min, params.z_mean_thickness_max))
+    z_max_thickness = np.int16(rng.uniform(params.z_max_thickness_extra_min, params.z_max_thickness_extra_max)) + mean_thickness
     thickness_z, _, _ = _sample_thickness_curve(
         mean_thickness=mean_thickness,
-        max_thickness=local_max_thickness,
-        max_wiggles=5,
-        sin_influence=0.15,
+        max_thickness=z_max_thickness,
+        max_wiggles=params.z_max_wiggles,
+        sin_influence=params.z_sin_influence,
         size=length,
     )
 
     branch, branch_sampled = _sample_secondary_branch(
         xy,
         z,
-        min_len=40,
-        max_len=220,
-        prob=branch_prob,
-        min_end_dist=10,
-        max_end_dist=100,
+        min_len=params.branch_min_len,
+        max_len=params.branch_max_len,
+        prob=params.branch_prob,
+        min_end_dist=params.branch_min_end_dist,
+        max_end_dist=params.branch_max_end_dist,
     )
 
-    capilars = _sample_capilars(xy=xy, z=z, thickness_xy=thickness_xy, thickness_z=thickness_z, rng=rng)
-    
+    capilars = _sample_capilars(
+        xy=xy,
+        z=z,
+        thickness_xy=thickness_xy,
+        thickness_z=thickness_z,
+        rng=rng,
+    )
+
     shape = synth.shape
     placed = False
     tries = 0
@@ -692,7 +800,7 @@ def _place_poly(synth, min_thickness, max_thickness, max_tries, wiggle_amp=150, 
     force = False
     while not placed and tries < max_tries:
         tries += 1
-        p_parallel = rng.uniform(0,1)
+        p_parallel = rng.uniform(0, 1)
         if p_parallel > 0.9:
             angle = previous_angle
             c, s = np.cos(angle), np.sin(angle)
@@ -705,7 +813,7 @@ def _place_poly(synth, min_thickness, max_thickness, max_tries, wiggle_amp=150, 
             start_xyz = (
                 np.clip(x0 + dx, 0, shape[0] - 1),
                 np.clip(y0 + dy, 0, shape[1] - 1),
-                z0
+                z0,
             )
             force = True
         else:
@@ -746,22 +854,21 @@ def _place_poly(synth, min_thickness, max_thickness, max_tries, wiggle_amp=150, 
                 start_xyz,
                 capilars,
             )
-        #r = 1
-        #grid = np.indices((2*r+1, 2*r+1, 2*r+1)) - r
-        #kernel = (grid**2).sum(0) <= r**2
-        #closed = binary_fill_holes(binary_closing(obj, structure=kernel))
         if _test_fit(synth=synth, candidate=obj) or force:
             synth[obj > 0] = new_idx
             return synth, True
-    #closed = gaussian_filter(closed.astype(np.float32), sigma=1.0) > 0.5
-    
+
     return synth, False
 
 def _dilate_synth(synth):
     for z in range(synth.shape[2]):
-        slice_ = synth[z].copy()
-        mask = binary_dilation(synth[..., z] > 0)
-        new_pixels = np.logical_xor(synth[..., z] > 0, mask)
+        slice_ = synth[..., z].copy()
+
+        mask = binary_dilation(slice_ > 0)
+        new_pixels = np.logical_xor(slice_ > 0, mask)
+
+        #print(f"dilating {np.count_nonzero(new_pixels)} pixels in slice {z}")
+
         coords = np.argwhere(new_pixels)
 
         for x, y in coords:
@@ -771,51 +878,108 @@ def _dilate_synth(synth):
             y1 = min(slice_.shape[1], y + 2)
 
             neighborhood = slice_[x0:x1, y0:y1]
-
             values = neighborhood[neighborhood > 0]
 
             if values.size == 0:
                 continue
 
             labels, counts = np.unique(values, return_counts=True)
-
-            # choose most frequent label
             max_count = counts.max()
             candidates = labels[counts == max_count]
 
             if len(candidates) == 1:
                 chosen = candidates[0]
             else:
-                # tie-break: choose smallest label (deterministic & stable)
                 chosen = candidates.min()
 
             synth[x, y, z] = chosen
 
-def generate_synth_tif(num_polys, max_tries, shape, name="syn.tif", branch_prob=0.15):
+    return synth
+
+
+def generate_synth_tif(num_polys, max_tries, shape, name="syn.tif", params=None):
     if not name.endswith(".tif"):
-        name = name + ".tif" 
+        name = name + ".tif"
+
+    if params is None:
+        params = argparse.Namespace(
+            min_thickness=8,
+            max_thickness=30,
+            place_poly_max_tries=20,
+            branch_prob=0.15,
+            wiggle_amp=150.0,
+            z_wiggle_scale=0.3,
+            xy_max_wiggles=5.0,
+            xy_sin_influence=0.15,
+            z_max_wiggles=5.0,
+            z_sin_influence=0.15,
+            xy_degree=10,
+            xy_bound=0.75,
+            xy_max_wiggle=0.095,
+            xy_coeff_damper=1.35,
+            z_degree=6,
+            z_bound=0.25,
+            z_max_wiggle=0.005,
+            z_coeff_damper=1.35,
+            xy_straight_prob=0.4,
+            xy_straight_max_length=500,
+            z_straight_prob=0.5,
+            z_straight_max_length=50,
+            branch_min_len=40,
+            branch_max_len=220,
+            branch_min_end_dist=10,
+            branch_max_end_dist=100,
+            length_min=400,
+            length_max=1025,
+            z_mean_thickness_min=5,
+            z_mean_thickness_max=15,
+            z_max_thickness_extra_min=3,
+            z_max_thickness_extra_max=5,
+            xy_local_max_thickness_min=3,
+            xy_local_max_thickness_max=8,
+        )
 
     synth = np.zeros(shape)
     tries = 0
     n = 0
     while tries < max_tries and n < num_polys:
         tries += 1
-        synth, success = _place_poly(synth=synth, min_thickness=8, max_thickness=30, max_tries=20, branch_prob=branch_prob)
+        synth, success = _place_poly(
+            synth=synth,
+            min_thickness=params.min_thickness,
+            max_thickness=params.max_thickness,
+            max_tries=params.place_poly_max_tries,
+            params=params,
+        )
         if success:
             print(f"placed poly number {n}")
             n += 1
             tries = 0
-            synth = _dilate_synth(synth)
-            save=np.transpose(synth, (2, 1, 0)).astype(np.float32)
-            tifffile.imwrite(
-                name,
-                save.astype(np.float32),
-                imagej=True
-            )
+    synth = _dilate_synth(synth)
+    save = np.transpose(synth, (2, 1, 0)).astype(np.float32)
+    tifffile.imwrite(
+        name,
+        save.astype(np.float32),
+        imagej=True,
+    )
     return synth
+def main():
+    args = parse_args()
+    os.makedirs(args.output_folder, exist_ok=True)
+
+    for i in range(args.num_images):
+        print("*" * 50)
+        print(f"image {i} / {args.num_images}")
+        print("*" * 50)
+        output_file = os.path.join(args.output_folder, f"{args.output_stem}{i}.tif")
+        generate_synth_tif(
+            num_polys=args.num_polys,
+            max_tries=args.max_tries,
+            shape=args.shape,
+            name=output_file,
+            params=args,
+        )
+
+
 if __name__ == "__main__":
-    for i in range(30):
-        print("*"*50)
-        print(f"image {i} / 30")
-        print("*"*50)
-        syn_full = generate_synth_tif(num_polys=64, max_tries=5, shape=(1024,1024,128), name=f"syn_{i}.tif")
+    main()
